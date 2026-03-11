@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Screen Mirror Cast Receiver</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; }
+        #cover {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain; /* 按图片比例完整展示，不裁切铺满 */
+            background: #000;
+            z-index: 10;
+        }
+        #video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            background: #000;
+            position: relative;
+            z-index: 1;
+        }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <img id="cover" class="hidden" alt="Cover" />
+    <video id="video" autoplay playsinline></video>
+
+    <!-- Google Cast Receiver SDK -->
+    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+    <script>
+        const video = document.getElementById('video');
+        const cover = document.getElementById('cover');
+
+        var pc = null;
+        var ws = null;
+        var signalingServerIP = null;
+        var signalingServerPort = 1118;
+        var heartbeatTimer = null;
+        var audioContext = null;
+        var audioNode = null;
+        var audioGainNode = null;
+        var audioWorkletReady = false;
+        var pendingAudioChunks = [];
+        var audioPacketCount = 0;
+
+        // 固定封面路径：请在 CastReceiver 目录放一张 cover.jpg
+        // 也可以改成 https 的完整 URL
+        const FIXED_COVER_URL = './cover.png';
+
+        function showCover() {
+            if (cover.src !== FIXED_COVER_URL) cover.src = FIXED_COVER_URL;
+            cover.classList.remove('hidden');
+        }
+
+        function hideCover() {
+            cover.classList.add('hidden');
+        }
+
+        // Cast Receiver 初始化
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
+        let hasSenderConnected = false;
+
+        // 监听自定义消息（从手机 App 发送的信令服务器 IP）
+        const CUSTOM_CHANNEL = 'urn:x-cast:com.screenmirror.webrtc';
+
+        context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
+            console.log('Custom message received:', event.data);
+            let data = event.data;
+            if (typeof data === 'string') {
+                try {
+                    data = JSON.parse(data);
+                } catch (e) {
+                    console.error('Failed to parse custom message JSON:', e);
+                    return;
+                }
+            }
+
+            if (data.type === 'start' && data.signalingIP) {
+                signalingServerIP = data.signalingIP;
+                signalingServerPort = Number(data.signalingPort || 1118);
+                // 设备端已开始会话：先展示固定封面（流没来之前用作占位）
+                showCover();
+                connectWebRTC(signalingServerIP, signalingServerPort);
+            } else if (data.type === 'stop') {
+                closeWebRTC();
+            }
+        });
+
+        // Sender 连接/断开时机：连接成功先展示封面
+        try {
+            context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, () => {
+                hasSenderConnected = true;
+                showCover();
+            });
+            context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
+                hasSenderConnected = false;
+                hideCover();
+            });
+        } catch (e) {
+            console.warn('Cast sender event listener setup failed:', e);
+        }
+
+        // CAF（Google Cast）投屏图片/视频：一旦媒体进入非 IDLE 状态，立刻隐藏封面
+        try {
+            playerManager.addEventListener(
+                cast.framework.events.EventType.PLAYER_STATE_CHANGED,
+                (event) => {
+                    const state = event && (event.playerState || event.value);
+                    if (state && state !== 'IDLE') {
+                        hideCover();
+                    } else if (hasSenderConnected) {
+                        showCover();
+                    }
+                }
+            );
+        } catch (e) {
+            console.warn('PlayerManager event listener setup failed:', e);
+        }
+
+        // 兜底：只要 video 元素开始有画面/播放，也隐藏封面
+        ['loadeddata', 'canplay', 'playing', 'timeupdate'].forEach((type) => {
+            video.addEventListener(type, () => hideCover(), { passive: true });
+        });
+
+        // 启动 Cast Receiver
+        const options = new cast.framework.CastReceiverOptions();
+        options.disableIdleTimeout = true;
+        context.start(options);
+
+        console.log('Cast Receiver started');
+
+        // WebRTC 连接
+        function connectWebRTC(ip, port) {
+            console.log('Connecting signaling server:', ip, port);
+
+            // 创建 WebSocket 连接到手机的信令服务器
+            const wsUrl = `ws://${ip}:${port}`;
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                showCover();
+                createPeerConnection();
+                ws.send(JSON.stringify({ type: 'ready' }));
+                startHeartbeat();
+            };
+
+            ws.onmessage = async (event) => {
+                if (typeof event.data !== 'string') {
+                    return;
+                }
+                const message = JSON.parse(event.data);
+                console.log('Signaling message:', message.type);
+
+                if (message.type === 'offer') {
+                    await handleOffer(message);
+                } else if (message.type === 'ice-candidate') {
+                    await handleIceCandidate(message);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                stopHeartbeat();
+                setTimeout(() => {
+                    if (signalingServerIP) {
+                        connectWebRTC(signalingServerIP, signalingServerPort);
+                    }
+                }, 3000);
+            };
+        }
+
+        function startHeartbeat() {
+            stopHeartbeat();
+            heartbeatTimer = setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+                }
+            }, 10000);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+
+        function createPeerConnection() {
+            const config = {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            };
+
+            pc = new RTCPeerConnection(config);
+
+            pc.ontrack = (event) => {
+                console.log('Media track received:', event.track.kind);
+                if (event.streams && event.streams[0] && video.srcObject !== event.streams[0]) {
+                    video.srcObject = event.streams[0];
+                }
+
+                if (event.track.kind === 'video') {
+                    video.muted = true;
+                    video.play().catch(e => console.error('Playback failed:', e));
+                    // 流开始播放后隐藏封面
+                    hideCover();
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        candidate: {
+                            candidate: event.candidate.candidate,
+                            sdpMid: event.candidate.sdpMid,
+                            sdpMLineIndex: event.candidate.sdpMLineIndex
+                        }
+                    }));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log('Connection state:', pc.connectionState);
+                if (pc.connectionState === 'connected') {
+                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                    // 断开或失败时重新显示封面
+                    showCover();
+                }
+            };
+
+            console.log('PeerConnection created');
+        }
+
+        async function handleOffer(message) {
+            if (!pc) createPeerConnection();
+
+            try {
+                const offer = new RTCSessionDescription({
+                    type: 'offer',
+                    sdp: message.sdp
+                });
+
+                await pc.setRemoteDescription(offer);
+                console.log('Remote offer set');
+
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                console.log('Answer created');
+
+                ws.send(JSON.stringify({
+                    type: 'answer',
+                    sdp: answer.sdp
+                }));
+            } catch (error) {
+                console.error('Failed to handle offer:', error);
+            }
+        }
+
+        async function handleIceCandidate(message) {
+            if (!pc) return;
+
+            try {
+                const candidate = new RTCIceCandidate(message.candidate);
+                await pc.addIceCandidate(candidate);
+                console.log('ICE candidate added');
+            } catch (error) {
+                console.error('Failed to add ICE candidate:', error);
+            }
+        }
+
+        function closeWebRTC() {
+            if (ws) {
+                stopHeartbeat();
+                ws.close();
+                ws = null;
+            }
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            video.srcObject = null;
+
+            if (audioContext) {
+                audioContext.close().catch(() => {});
+                audioContext = null;
+            }
+            audioNode = null;
+            audioGainNode = null;
+            audioWorkletReady = false;
+            pendingAudioChunks = [];
+            showCover();
+        }
+    </script>
+</body>
+</html>
+
