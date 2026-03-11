@@ -19,15 +19,25 @@
             width: 100vw;
             height: 100vh;
             object-fit: contain;
-            background: #000;
+            background: transparent;
             position: relative;
             z-index: 1;
+        }
+        #castImage {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            background: #000;
+            z-index: 2;
         }
         .hidden { display: none !important; }
     </style>
 </head>
 <body>
     <img id="cover" class="hidden" alt="Cover" />
+    <img id="castImage" class="hidden" alt="Cast Image" />
     <video id="video" autoplay playsinline></video>
 
     <!-- Google Cast Receiver SDK -->
@@ -36,6 +46,7 @@
     <script>
         const video = document.getElementById('video');
         const cover = document.getElementById('cover');
+        const castImage = document.getElementById('castImage');
 
         var pc = null;
         var ws = null;
@@ -49,7 +60,7 @@
         var pendingAudioChunks = [];
         var audioPacketCount = 0;
 
-        // 固定封面路径：请在 CastReceiver 目录放一张 cover.jpg
+        // 固定封面路径：请在 CastReceiver 目录放一张 cover.png
         // 也可以改成 https 的完整 URL
         const FIXED_COVER_URL = './cover.png';
 
@@ -60,6 +71,21 @@
 
         function hideCover() {
             cover.classList.add('hidden');
+        }
+
+        function showCastImage(url) {
+            if (!url) return;
+            if (castImage.src !== url) castImage.src = url;
+            castImage.classList.remove('hidden');
+            video.classList.add('hidden');
+            hideCover();
+        }
+
+        function hideCastImage() {
+            castImage.classList.add('hidden');
+            if (video.classList.contains('hidden')) {
+                video.classList.remove('hidden');
+            }
         }
 
         // Cast Receiver 初始化
@@ -109,6 +135,29 @@
 
         // CAF（Google Cast）投屏图片/视频：一旦媒体进入非 IDLE 状态，立刻隐藏封面
         try {
+            // 让 CAF 明确使用我们的 video 元素承载 A/V（图片走独立 img）
+            try { playerManager.setMediaElement(video); } catch (e) {}
+
+            playerManager.setMessageInterceptor(
+                cast.framework.messages.MessageType.LOAD,
+                (loadRequestData) => {
+                    try {
+                        const media = loadRequestData && loadRequestData.media;
+                        const contentId = media && media.contentId;
+                        const contentType = (media && media.contentType) ? String(media.contentType).toLowerCase() : '';
+                        const isImage = contentType.startsWith('image/');
+                        if (isImage && contentId) {
+                            showCastImage(String(contentId));
+                        } else {
+                            hideCastImage();
+                        }
+                    } catch (e) {
+                        // ignore
+                    }
+                    return loadRequestData;
+                }
+            );
+
             playerManager.addEventListener(
                 cast.framework.events.EventType.PLAYER_STATE_CHANGED,
                 (event) => {
@@ -116,7 +165,10 @@
                     if (state && state !== 'IDLE') {
                         hideCover();
                     } else if (hasSenderConnected) {
+                        hideCastImage();
                         showCover();
+                    } else {
+                        hideCastImage();
                     }
                 }
             );
@@ -126,7 +178,10 @@
 
         // 兜底：只要 video 元素开始有画面/播放，也隐藏封面
         ['loadeddata', 'canplay', 'playing', 'timeupdate'].forEach((type) => {
-            video.addEventListener(type, () => hideCover(), { passive: true });
+            video.addEventListener(type, () => {
+                hideCastImage();
+                hideCover();
+            }, { passive: true });
         });
 
         // 启动 Cast Receiver
@@ -309,4 +364,3 @@
     </script>
 </body>
 </html>
-
