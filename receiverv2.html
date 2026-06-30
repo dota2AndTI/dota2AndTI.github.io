@@ -11,16 +11,17 @@
             inset: 0;
             width: 100vw;
             height: 100vh;
-            object-fit: contain; /* 按图片比例完整展示，不裁切铺满 */
+            object-fit: contain;
             background: #000;
             z-index: 10;
         }
-        #video {
+        .media-video {
+            position: fixed;
+            inset: 0;
             width: 100vw;
             height: 100vh;
             object-fit: contain;
-            background: transparent;
-            position: relative;
+            background: #000;
             z-index: 1;
         }
         #castImage {
@@ -38,13 +39,14 @@
 <body>
     <img id="cover" class="hidden" alt="Cover" />
     <img id="castImage" class="hidden" alt="Cast Image" />
-    <video id="video" autoplay playsinline></video>
+    <video id="cafVideo" class="media-video hidden" autoplay playsinline></video>
+    <video id="mirrorVideo" class="media-video hidden" autoplay playsinline muted></video>
 
-    <!-- Google Cast Receiver SDK -->
     <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 
     <script>
-        const video = document.getElementById('video');
+        const cafVideo = document.getElementById('cafVideo');
+        const mirrorVideo = document.getElementById('mirrorVideo');
         const cover = document.getElementById('cover');
         const castImage = document.getElementById('castImage');
 
@@ -53,17 +55,10 @@
         var signalingServerIP = null;
         var signalingServerPort = 1118;
         var mirroringActive = false;
-        var cafMediaLoading = false;
+        var cafMediaActive = false;
+        var cafMediaPending = false;
         var heartbeatTimer = null;
-        var audioContext = null;
-        var audioNode = null;
-        var audioGainNode = null;
-        var audioWorkletReady = false;
-        var pendingAudioChunks = [];
-        var audioPacketCount = 0;
 
-        // 固定封面路径：请在 CastReceiver 目录放一张 cover.png
-        // 也可以改成 https 的完整 URL
         const FIXED_COVER_URL = './cover.png';
 
         function showCover() {
@@ -77,23 +72,43 @@
 
         function showCastImage(url) {
             if (!url) return;
+            cafMediaPending = false;
+            cafMediaActive = false;
+            hideMirrorLayer();
+            hideCAFLayer();
             if (castImage.src !== url) castImage.src = url;
             castImage.classList.remove('hidden');
-            video.classList.add('hidden');
             hideCover();
         }
 
         function hideCastImage() {
             castImage.classList.add('hidden');
-            if (video.classList.contains('hidden')) {
-                video.classList.remove('hidden');
-            }
         }
 
-        // CAF 投屏前释放 WebRTC，避免 video.srcObject 占用同一 video 元素
-        function releaseWebRTCForCAF() {
-            mirroringActive = false;
-            signalingServerIP = null;
+        function hideMirrorLayer() {
+            mirrorVideo.classList.add('hidden');
+            mirrorVideo.srcObject = null;
+        }
+
+        function showMirrorLayer() {
+            cafMediaPending = false;
+            cafMediaActive = false;
+            hideCastImage();
+            hideCAFLayer();
+            mirrorVideo.classList.remove('hidden');
+        }
+
+        function hideCAFLayer() {
+            cafVideo.classList.add('hidden');
+        }
+
+        function showCAFLayer() {
+            hideCastImage();
+            hideMirrorLayer();
+            cafVideo.classList.remove('hidden');
+        }
+
+        function stopWebRTCConnection() {
             stopHeartbeat();
             if (ws) {
                 ws.onclose = null;
@@ -104,24 +119,58 @@
                 pc.close();
                 pc = null;
             }
-            video.srcObject = null;
-            video.removeAttribute('src');
-            try { video.load(); } catch (e) {}
-            video.muted = false;
-            video.classList.remove('hidden');
+            mirrorVideo.srcObject = null;
+        }
+
+        function stopCAFPlayback() {
+            try {
+                playerManager.stop();
+            } catch (e) {}
+            cafMediaPending = false;
+            cafMediaActive = false;
+        }
+
+        function prepareMirrorPlayback() {
+            cafMediaPending = false;
+            cafMediaActive = false;
+            mirroringActive = true;
+            stopCAFPlayback();
+            stopWebRTCConnection();
+            showMirrorLayer();
+            showCover();
+        }
+
+        function prepareCAFPlayback() {
+            mirroringActive = false;
+            signalingServerIP = null;
+            cafMediaPending = true;
+            cafMediaActive = false;
+            stopWebRTCConnection();
+            showCAFLayer();
             hideCover();
         }
 
-        // Cast Receiver 初始化
+        function closeWebRTC() {
+            mirroringActive = false;
+            signalingServerIP = null;
+            stopWebRTCConnection();
+            hideMirrorLayer();
+            if (!cafMediaActive && !cafMediaPending) {
+                showCover();
+            }
+        }
+
+        function shouldShowIdleCover() {
+            return hasSenderConnected && !mirroringActive && !cafMediaActive && !cafMediaPending;
+        }
+
         const context = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
         let hasSenderConnected = false;
 
-        // 监听自定义消息（从手机 App 发送的信令服务器 IP）
         const CUSTOM_CHANNEL = 'urn:x-cast:com.screenmirror.webrtc';
 
         context.addCustomMessageListener(CUSTOM_CHANNEL, (event) => {
-            console.log('Custom message received:', event.data);
             let data = event.data;
             if (typeof data === 'string') {
                 try {
@@ -133,37 +182,46 @@
             }
 
             if (data.type === 'start' && data.signalingIP) {
-                mirroringActive = true;
                 signalingServerIP = data.signalingIP;
                 signalingServerPort = Number(data.signalingPort || 1118);
-                // 设备端已开始会话：先展示固定封面（流没来之前用作占位）
-                showCover();
+                prepareMirrorPlayback();
                 connectWebRTC(signalingServerIP, signalingServerPort);
             } else if (data.type === 'stop') {
                 closeWebRTC();
             }
         });
 
-        // Sender 连接/断开时机：连接成功先展示封面
         try {
             context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, () => {
                 hasSenderConnected = true;
-                if (!cafMediaLoading) {
+                if (shouldShowIdleCover()) {
                     showCover();
                 }
             });
             context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
                 hasSenderConnected = false;
+                cafMediaPending = false;
+                cafMediaActive = false;
+                mirroringActive = false;
+                signalingServerIP = null;
+                stopCAFPlayback();
+                stopWebRTCConnection();
                 hideCover();
+                hideCastImage();
+                hideMirrorLayer();
+                hideCAFLayer();
             });
         } catch (e) {
             console.warn('Cast sender event listener setup failed:', e);
         }
 
-        // CAF（Google Cast）投屏图片/视频：一旦媒体进入非 IDLE 状态，立刻隐藏封面
         try {
-            // 让 CAF 明确使用我们的 video 元素承载 A/V（图片走独立 img）
-            try { playerManager.setMediaElement(video); } catch (e) {}
+            playerManager.setMediaElement(cafVideo);
+
+            const playbackConfig = new cast.framework.PlaybackConfig();
+            playbackConfig.autoResumeDuration = 5;
+            playbackConfig.autoPauseDuration = 0;
+            playerManager.setPlaybackConfig(playbackConfig);
 
             function looksLikeImageUrl(url) {
                 if (!url) return false;
@@ -191,6 +249,8 @@
                     u.endsWith('.webm') ||
                     u.endsWith('.mov') ||
                     u.endsWith('.ts') ||
+                    u.endsWith('.mp3') ||
+                    u.endsWith('.m4a') ||
                     u.includes('.mp4?') ||
                     u.includes('.m3u8?') ||
                     u.includes('/proxy/media/') ||
@@ -198,34 +258,9 @@
                 );
             }
 
-            function patchMislabeledVideoLoad(media) {
-                if (!media) return;
-                const contentType = media.contentType ? String(media.contentType).toLowerCase() : '';
-                if (!contentType.startsWith('video/') && !contentType.startsWith('audio/') && !contentType.includes('mpegurl')) {
-                    media.contentType = 'video/mp4';
-                }
-                if (media.streamType === cast.framework.messages.StreamType.NONE) {
-                    media.streamType = cast.framework.messages.StreamType.BUFFERED;
-                }
-                const metadata = media.metadata;
-                if (metadata && metadata.metadataType === cast.framework.messages.MetadataType.PHOTO) {
-                    metadata.metadataType = cast.framework.messages.MetadataType.MOVIE;
-                }
-            }
-
-            function prepareCAFVideoPlayback(media, contentId) {
-                cafMediaLoading = true;
-                releaseWebRTCForCAF();
-                hideCastImage();
-                if (media && (String(media.contentType || '').toLowerCase().startsWith('video/') || looksLikeVideoUrl(contentId))) {
-                    patchMislabeledVideoLoad(media);
-                }
-            }
-
             function isPhotoMetadata(metadata) {
                 try {
-                    const type = metadata && metadata.metadataType;
-                    return type === cast.framework.messages.MetadataType.PHOTO;
+                    return metadata && metadata.metadataType === cast.framework.messages.MetadataType.PHOTO;
                 } catch (e) {
                     return false;
                 }
@@ -241,6 +276,7 @@
                         const metadata = media && media.metadata;
                         const isVideo =
                             contentType.startsWith('video/') ||
+                            contentType.startsWith('audio/') ||
                             contentType.includes('mpegurl') ||
                             looksLikeVideoUrl(contentId);
                         const isImage = !isVideo && (
@@ -248,15 +284,19 @@
                             isPhotoMetadata(metadata) ||
                             looksLikeImageUrl(contentId)
                         );
+
                         if (isImage && contentId) {
-                            cafMediaLoading = false;
-                            releaseWebRTCForCAF();
+                            mirroringActive = false;
+                            signalingServerIP = null;
+                            stopWebRTCConnection();
+                            stopCAFPlayback();
+                            hideCAFLayer();
                             showCastImage(String(contentId));
                         } else if (contentId) {
-                            prepareCAFVideoPlayback(media, contentId);
+                            prepareCAFPlayback();
                         }
                     } catch (e) {
-                        // ignore
+                        console.warn('LOAD interceptor failed:', e);
                     }
                     return loadRequestData;
                 }
@@ -267,59 +307,66 @@
                 (event) => {
                     const state = event && (event.playerState || event.value);
                     if (state && state !== 'IDLE') {
-                        cafMediaLoading = false;
+                        cafMediaPending = false;
+                        cafMediaActive = true;
+                        showCAFLayer();
                         hideCover();
-                    } else if (hasSenderConnected && !cafMediaLoading) {
+                        return;
+                    }
+                    cafMediaActive = false;
+                    if (shouldShowIdleCover()) {
                         hideCastImage();
                         showCover();
-                    } else {
-                        hideCastImage();
+                    }
+                }
+            );
+
+            playerManager.addEventListener(
+                cast.framework.events.EventType.ERROR,
+                () => {
+                    cafMediaPending = false;
+                    cafMediaActive = false;
+                    if (shouldShowIdleCover()) {
+                        showCover();
                     }
                 }
             );
         } catch (e) {
-            console.warn('PlayerManager event listener setup failed:', e);
+            console.warn('PlayerManager setup failed:', e);
         }
 
-        // 兜底：只要 video 元素开始有画面/播放，也隐藏封面
-        ['loadeddata', 'canplay', 'playing', 'timeupdate'].forEach((type) => {
-            video.addEventListener(type, () => {
-                hideCastImage();
-                hideCover();
-            }, { passive: true });
-        });
+        mirrorVideo.addEventListener('playing', () => {
+            hideCover();
+        }, { passive: true });
 
-        // 启动 Cast Receiver
+        cafVideo.addEventListener('playing', () => {
+            cafMediaPending = false;
+            cafMediaActive = true;
+            hideCastImage();
+            hideCover();
+        }, { passive: true });
+
         const options = new cast.framework.CastReceiverOptions();
         options.disableIdleTimeout = true;
         context.start(options);
 
-        console.log('Cast Receiver started');
-
-        // WebRTC 连接
         function connectWebRTC(ip, port) {
-            console.log('Connecting signaling server:', ip, port);
-
-            // 创建 WebSocket 连接到手机的信令服务器
-            const wsUrl = `ws://${ip}:${port}`;
+            const wsUrl = 'ws://' + ip + ':' + port;
             ws = new WebSocket(wsUrl);
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
-                console.log('WebSocket connected');
-                showCover();
-                createPeerConnection();
+                if (!mirroringActive) return;
+                if (!pc) {
+                    createPeerConnection();
+                }
                 ws.send(JSON.stringify({ type: 'ready' }));
                 startHeartbeat();
             };
 
             ws.onmessage = async (event) => {
-                if (typeof event.data !== 'string') {
-                    return;
-                }
+                if (typeof event.data !== 'string') return;
                 const message = JSON.parse(event.data);
-                console.log('Signaling message:', message.type);
-
                 if (message.type === 'offer') {
                     await handleOffer(message);
                 } else if (message.type === 'ice-candidate') {
@@ -332,7 +379,6 @@
             };
 
             ws.onclose = () => {
-                console.log('WebSocket disconnected');
                 stopHeartbeat();
                 const ip = signalingServerIP;
                 const port = signalingServerPort;
@@ -361,26 +407,26 @@
         }
 
         function createPeerConnection() {
-            const config = {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+
+            pc = new RTCPeerConnection({
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
                     { urls: 'stun:stun1.l.google.com:19302' }
                 ]
-            };
-
-            pc = new RTCPeerConnection(config);
+            });
 
             pc.ontrack = (event) => {
                 if (!mirroringActive) return;
-                console.log('Media track received:', event.track.kind);
-                if (event.streams && event.streams[0] && video.srcObject !== event.streams[0]) {
-                    video.srcObject = event.streams[0];
+                showMirrorLayer();
+                if (event.streams && event.streams[0]) {
+                    mirrorVideo.srcObject = event.streams[0];
                 }
-
                 if (event.track.kind === 'video') {
-                    video.muted = true;
-                    video.play().catch(e => console.error('Playback failed:', e));
-                    // 流开始播放后隐藏封面
+                    mirrorVideo.play().catch((e) => console.error('Mirror playback failed:', e));
                     hideCover();
                 }
             };
@@ -399,80 +445,45 @@
             };
 
             pc.onconnectionstatechange = () => {
-                console.log('Connection state:', pc.connectionState);
-                if (pc.connectionState === 'connected') {
-                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                    // 断开或失败时重新显示封面
+                if (!mirroringActive || !pc) return;
+                if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                     showCover();
                 }
             };
-
-            console.log('PeerConnection created');
         }
 
         async function handleOffer(message) {
-            if (!pc) createPeerConnection();
+            if (!mirroringActive) return;
+            if (!pc) {
+                createPeerConnection();
+            }
 
             try {
-                const offer = new RTCSessionDescription({
+                await pc.setRemoteDescription(new RTCSessionDescription({
                     type: 'offer',
                     sdp: message.sdp
-                });
-
-                await pc.setRemoteDescription(offer);
-                console.log('Remote offer set');
-
+                }));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                console.log('Answer created');
-
-                ws.send(JSON.stringify({
-                    type: 'answer',
-                    sdp: answer.sdp
-                }));
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'answer',
+                        sdp: answer.sdp
+                    }));
+                }
             } catch (error) {
                 console.error('Failed to handle offer:', error);
             }
         }
 
         async function handleIceCandidate(message) {
-            if (!pc) return;
-
+            if (!pc || !mirroringActive) return;
             try {
-                const candidate = new RTCIceCandidate(message.candidate);
-                await pc.addIceCandidate(candidate);
-                console.log('ICE candidate added');
+                await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
             } catch (error) {
                 console.error('Failed to add ICE candidate:', error);
             }
         }
-
-        function closeWebRTC() {
-            mirroringActive = false;
-            signalingServerIP = null;
-            if (ws) {
-                stopHeartbeat();
-                ws.onclose = null;
-                ws.close();
-                ws = null;
-            }
-            if (pc) {
-                pc.close();
-                pc = null;
-            }
-            video.srcObject = null;
-
-            if (audioContext) {
-                audioContext.close().catch(() => {});
-                audioContext = null;
-            }
-            audioNode = null;
-            audioGainNode = null;
-            audioWorkletReady = false;
-            pendingAudioChunks = [];
-            showCover();
-        }
     </script>
 </body>
 </html>
-
