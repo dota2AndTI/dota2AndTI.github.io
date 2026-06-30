@@ -52,6 +52,8 @@
         var ws = null;
         var signalingServerIP = null;
         var signalingServerPort = 1118;
+        var mirroringActive = false;
+        var cafMediaLoading = false;
         var heartbeatTimer = null;
         var audioContext = null;
         var audioNode = null;
@@ -88,6 +90,28 @@
             }
         }
 
+        // CAF 投屏前释放 WebRTC，避免 video.srcObject 占用同一 video 元素
+        function releaseWebRTCForCAF() {
+            mirroringActive = false;
+            signalingServerIP = null;
+            stopHeartbeat();
+            if (ws) {
+                ws.onclose = null;
+                ws.close();
+                ws = null;
+            }
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            video.srcObject = null;
+            video.removeAttribute('src');
+            try { video.load(); } catch (e) {}
+            video.muted = false;
+            video.classList.remove('hidden');
+            hideCover();
+        }
+
         // Cast Receiver 初始化
         const context = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
@@ -109,6 +133,7 @@
             }
 
             if (data.type === 'start' && data.signalingIP) {
+                mirroringActive = true;
                 signalingServerIP = data.signalingIP;
                 signalingServerPort = Number(data.signalingPort || 1118);
                 // 设备端已开始会话：先展示固定封面（流没来之前用作占位）
@@ -123,7 +148,9 @@
         try {
             context.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, () => {
                 hasSenderConnected = true;
-                showCover();
+                if (!cafMediaLoading) {
+                    showCover();
+                }
             });
             context.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
                 hasSenderConnected = false;
@@ -138,6 +165,72 @@
             // 让 CAF 明确使用我们的 video 元素承载 A/V（图片走独立 img）
             try { playerManager.setMediaElement(video); } catch (e) {}
 
+            function looksLikeImageUrl(url) {
+                if (!url) return false;
+                const u = String(url).toLowerCase();
+                return (
+                    u.endsWith('.jpg') ||
+                    u.endsWith('.jpeg') ||
+                    u.endsWith('.png') ||
+                    u.endsWith('.webp') ||
+                    u.endsWith('.gif') ||
+                    u.includes('.jpg?') ||
+                    u.includes('.jpeg?') ||
+                    u.includes('.png?') ||
+                    u.includes('.webp?') ||
+                    u.includes('.gif?')
+                );
+            }
+
+            function looksLikeVideoUrl(url) {
+                if (!url) return false;
+                const u = String(url).toLowerCase();
+                return (
+                    u.endsWith('.mp4') ||
+                    u.endsWith('.m3u8') ||
+                    u.endsWith('.webm') ||
+                    u.endsWith('.mov') ||
+                    u.endsWith('.ts') ||
+                    u.includes('.mp4?') ||
+                    u.includes('.m3u8?') ||
+                    u.includes('/proxy/media/') ||
+                    u.includes('videoplayback')
+                );
+            }
+
+            function patchMislabeledVideoLoad(media) {
+                if (!media) return;
+                const contentType = media.contentType ? String(media.contentType).toLowerCase() : '';
+                if (!contentType.startsWith('video/') && !contentType.startsWith('audio/') && !contentType.includes('mpegurl')) {
+                    media.contentType = 'video/mp4';
+                }
+                if (media.streamType === cast.framework.messages.StreamType.NONE) {
+                    media.streamType = cast.framework.messages.StreamType.BUFFERED;
+                }
+                const metadata = media.metadata;
+                if (metadata && metadata.metadataType === cast.framework.messages.MetadataType.PHOTO) {
+                    metadata.metadataType = cast.framework.messages.MetadataType.MOVIE;
+                }
+            }
+
+            function prepareCAFVideoPlayback(media, contentId) {
+                cafMediaLoading = true;
+                releaseWebRTCForCAF();
+                hideCastImage();
+                if (media && (String(media.contentType || '').toLowerCase().startsWith('video/') || looksLikeVideoUrl(contentId))) {
+                    patchMislabeledVideoLoad(media);
+                }
+            }
+
+            function isPhotoMetadata(metadata) {
+                try {
+                    const type = metadata && metadata.metadataType;
+                    return type === cast.framework.messages.MetadataType.PHOTO;
+                } catch (e) {
+                    return false;
+                }
+            }
+
             playerManager.setMessageInterceptor(
                 cast.framework.messages.MessageType.LOAD,
                 (loadRequestData) => {
@@ -145,11 +238,22 @@
                         const media = loadRequestData && loadRequestData.media;
                         const contentId = media && media.contentId;
                         const contentType = (media && media.contentType) ? String(media.contentType).toLowerCase() : '';
-                        const isImage = contentType.startsWith('image/');
+                        const metadata = media && media.metadata;
+                        const isVideo =
+                            contentType.startsWith('video/') ||
+                            contentType.includes('mpegurl') ||
+                            looksLikeVideoUrl(contentId);
+                        const isImage = !isVideo && (
+                            contentType.startsWith('image/') ||
+                            isPhotoMetadata(metadata) ||
+                            looksLikeImageUrl(contentId)
+                        );
                         if (isImage && contentId) {
+                            cafMediaLoading = false;
+                            releaseWebRTCForCAF();
                             showCastImage(String(contentId));
-                        } else {
-                            hideCastImage();
+                        } else if (contentId) {
+                            prepareCAFVideoPlayback(media, contentId);
                         }
                     } catch (e) {
                         // ignore
@@ -163,8 +267,9 @@
                 (event) => {
                     const state = event && (event.playerState || event.value);
                     if (state && state !== 'IDLE') {
+                        cafMediaLoading = false;
                         hideCover();
-                    } else if (hasSenderConnected) {
+                    } else if (hasSenderConnected && !cafMediaLoading) {
                         hideCastImage();
                         showCover();
                     } else {
@@ -229,9 +334,11 @@
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
                 stopHeartbeat();
+                const ip = signalingServerIP;
+                const port = signalingServerPort;
                 setTimeout(() => {
-                    if (signalingServerIP) {
-                        connectWebRTC(signalingServerIP, signalingServerPort);
+                    if (mirroringActive && ip) {
+                        connectWebRTC(ip, port);
                     }
                 }, 3000);
             };
@@ -264,6 +371,7 @@
             pc = new RTCPeerConnection(config);
 
             pc.ontrack = (event) => {
+                if (!mirroringActive) return;
                 console.log('Media track received:', event.track.kind);
                 if (event.streams && event.streams[0] && video.srcObject !== event.streams[0]) {
                     video.srcObject = event.streams[0];
@@ -340,8 +448,11 @@
         }
 
         function closeWebRTC() {
+            mirroringActive = false;
+            signalingServerIP = null;
             if (ws) {
                 stopHeartbeat();
+                ws.onclose = null;
                 ws.close();
                 ws = null;
             }
@@ -364,3 +475,4 @@
     </script>
 </body>
 </html>
+
